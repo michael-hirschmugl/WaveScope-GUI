@@ -1,0 +1,71 @@
+# --- Virtual environments ---
+src/venv/
+src/.venv/
+src/ENV/
+src/env/
+venv/
+.venv/
+ENV/
+env/
+
+# --- Python bytecode / caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.pytype/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# --- Build / packaging ---
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+wheelhouse/
+MANIFEST
+
+# --- Logs / runtime ---
+*.log
+*.pid
+*.sqlite3
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- IDEs / Editors ---
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+
+# --- OS junk (Windows/macOS/Linux) ---
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# --- Python tooling configs (optional local overrides) ---
+.python-version
+poetry.lock
+Pipfile.lock
+
+# --- Local secrets / env files ---
+.env
+.env.*
+*.pem
+*.key
+
+# --- Project-specific (optional) ---
+# If you generate captured scope data, dumps, exports, etc.
+data/
+exports/
+out/

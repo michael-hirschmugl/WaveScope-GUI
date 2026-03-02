@@ -32,6 +32,23 @@ def main():
         except MeasurementDeviceError as e:
             print(f"\nServiceGetHWVersion failed: {e}")
 
+        # --- NEW: query connected sensors on DT_1 / DT_2 ---------------------
+        try:
+            connected = vas.ServiceGetConnectedSensors()
+            print("\nServiceGetConnectedSensors():")
+            print(f"  DT_1: 0x{connected['DT_1']:04X}")
+            print(f"  DT_2: 0x{connected['DT_2']:04X}")
+
+            # Check whether the 30 bar pressure sensor (ID 0x08) is connected
+            pressure30 = vas.CheckPressure30Sensor()
+            print("\n30 bar Sensor (DRUCK_30 / ID 0x08) connected?")
+            print(f"  DT_1: {pressure30['DT_1']}")
+            print(f"  DT_2: {pressure30['DT_2']}")
+            print(f"  any : {pressure30['any']}")
+
+        except MeasurementDeviceError as e:
+            print(f"\nServiceGetConnectedSensors / Sensor check failed: {e}")
+
     except MeasurementDeviceError as e:
         print(f"Error: {e}")
         sys.exit(2)

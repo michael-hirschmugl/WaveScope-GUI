@@ -58,6 +58,7 @@ class MeasurementDevice:
         "IZNG_1800": 0x04,
         "DRUCK_1": 0x01,
         "DRUCK_4": 0x02,
+        "DRUCK_30": 0x08,
         "DRUCK_60": 0x03,
         "DRUCK_400": 0x04,
         "TEMP_LIQ": 0x05,

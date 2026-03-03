@@ -14,78 +14,78 @@ from matplotlib.figure import Figure
 
 
 # ============================================================================
-# Conversion model used here (based on firmware conventions for DT pressure):
+# Scope sample decoding + current conversion for DT pressure/current front-end
 #
 # AVERAGE payload:
-#   uint16 per sample:
+#   uint16 per sample (big-endian):
 #     bits 0..11  -> raw12 value (0..4095)
 #     bits 12..15 -> marker flags (0..15)
 #
 # For plotting/metrics we ignore samples with marks != 0 (trigger/marker events).
 #
-# RAW(12-bit) -> Voltage:
+# RAW(12-bit) -> Voltage (offset-binary around 2048):
 #   V = (raw12 - 2048) / 2048.0 * V_FS
 #
 # Voltage -> Current:
 #   I_mA = (V / R_SHUNT) * 1000
 #
-# Calibration / correction (from documentation):
-#   data(corr.) = (gain/10000 + 1) * data + offset
+# Calibration (firmware semantics, important):
+#   - Gains are ppm-like: gainFactor = 1 + gain/100000
+#   - Offsets are also ppm-like and applied as fraction of full-range:
+#       V_corr = V * fullGain + (fullOffset_ppm / 100000) * V_FS
 #
-# Here we compute:
-#   extGainFactor = 1 + CalGain/10000
-#   intGainFactor = 1 + ChGain/10000
-#   fullGain      = extGainFactor * intGainFactor
-#   fullOffset    = fullGain * ChOffset + CalOffset
+# Composition:
+#   fullGain       = (1 + intGain/100000) * (1 + extGain/100000)
+#   fullOffset_ppm = fullGain * intOffset + extOffset
 #
-# NOTE:
-# - This matches the formula style described in the docs.
-# - Some firmware paths historically use 100000 instead of 10000. If your results
-#   look off by ~10x in gain correction, change GAIN_DIV below accordingly.
+# Where:
+#   extOffset = frame["CalOffset"]
+#   extGain   = frame["CalGain"]
+#   intOffset = frame["CalcOffsetScopeChannel"]
+#   intGain   = frame["CalcGainScopeChannel"]
 # ============================================================================
 
-V_FS_DEFAULT = 1.0       # Volts full-scale used for raw12->V mapping
-R_SHUNT_DEFAULT = 49.9   # Ohms shunt for V->I conversion
+V_FS_DEFAULT = 1.0        # Volts full-scale used for raw12->V mapping (DT front-end often 1.0V effective)
+R_SHUNT_DEFAULT = 49.9    # Ohms shunt for V->I conversion (typical 49.9Ω)
+GAIN_DIV = 100000.0       # firmware uses ppm-like scaling
 
-GAIN_DIV = 10000.0       # per documentation: gain/10000 + 1
 
-
-def raw12_to_voltage(raw12: int, v_fs: float = V_FS_DEFAULT) -> float:
+def raw12_to_voltage(raw12: int, v_fs: float) -> float:
     """Convert 12-bit offset-binary code to volts."""
     return ((float(raw12) - 2048.0) / 2048.0) * float(v_fs)
 
 
-def voltage_to_mA(v: float, r_shunt: float = R_SHUNT_DEFAULT) -> float:
+def voltage_to_mA(v: float, r_shunt: float) -> float:
     """Convert volts across shunt to mA."""
     return (float(v) / float(r_shunt)) * 1000.0
 
 
-def compute_full_gain_offset_from_frame(frame: dict) -> tuple[float, float]:
+def compute_full_gain_and_offset_ppm(frame: dict) -> tuple[float, float]:
     """
-    Compute fullGain/fullOffset using the documentation formula:
+    Compute fullGain and fullOffset_ppm per firmware semantics.
 
-      data(corr.) = (gain/10000 + 1) * data + offset
-
-    We treat:
-      CalGain  -> external gain
-      CalOffset -> external offset
-      CalcGainScopeChannel -> channel/internal gain
-      CalcOffsetScopeChannel -> channel/internal offset
-
-    fullGain   = (1 + CalGain/GAIN_DIV) * (1 + ChGain/GAIN_DIV)
-    fullOffset = fullGain * ChOffset + CalOffset
+    fullGain       = (1 + intGain/1e5) * (1 + extGain/1e5)
+    fullOffset_ppm = fullGain * intOffset + extOffset
     """
-    cal_gain = float(frame.get("CalGain", 0))
-    cal_off = float(frame.get("CalOffset", 0))
-    ch_gain = float(frame.get("CalcGainScopeChannel", 0))
-    ch_off = float(frame.get("CalcOffsetScopeChannel", 0))
+    ext_gain = float(frame.get("CalGain", 0))
+    ext_off = float(frame.get("CalOffset", 0))
+    int_gain = float(frame.get("CalcGainScopeChannel", 0))
+    int_off = float(frame.get("CalcOffsetScopeChannel", 0))
 
-    ext_gain_factor = 1.0 + (cal_gain / GAIN_DIV)
-    int_gain_factor = 1.0 + (ch_gain / GAIN_DIV)
-    full_gain = ext_gain_factor * int_gain_factor
-    full_offset = (full_gain * ch_off) + cal_off
+    full_gain = (1.0 + int_gain / GAIN_DIV) * (1.0 + ext_gain / GAIN_DIV)
+    full_offset_ppm = (full_gain * int_off) + ext_off
+    return full_gain, full_offset_ppm
 
-    return full_gain, full_offset
+
+def apply_calibration_to_voltage(v: float, v_fs: float, full_gain: float, full_offset_ppm: float) -> float:
+    """
+    Apply calibration to a voltage-like quantity, matching the firmware's usage:
+
+      v_corr = v * fullGain + (fullOffset_ppm / 1e5) * full_range
+
+    Here we use full_range = V_FS (effective full-scale volts used in raw12_to_voltage).
+    """
+    return (v * full_gain) + ((full_offset_ppm / GAIN_DIV) * float(v_fs))
 
 
 def decode_scope_samples(frame: dict) -> dict:
@@ -468,11 +468,24 @@ class ScopeGUI(tk.Tk):
                 v_fs = self._get_float_setting(self.vfs_var, V_FS_DEFAULT)
                 r_shunt = self._get_float_setting(self.rshunt_var, R_SHUNT_DEFAULT)
 
-                # Choose what to display: RAW12 or mA
+                # Calibration fields from packet
+                cal_off = frame.get("CalOffset", 0)
+                cal_gain = frame.get("CalGain", 0)
+                ch_off = frame.get("CalcOffsetScopeChannel", 0)
+                ch_gain = frame.get("CalcGainScopeChannel", 0)
+
+                # Firmware-style full gain/offset (offset is ppm-of-full-range)
+                full_gain, full_offset_ppm = compute_full_gain_and_offset_ppm(frame)
+
+                # Choose what to display: RAW12 or calibrated mA
                 disp_mode = self.display_mode_var.get().strip().upper()
                 if disp_mode == "MA":
-                    y = [voltage_to_mA(raw12_to_voltage(v, v_fs), r_shunt) for v in valid_raw12]
-                    self.ax.set_ylabel("Current (mA)")
+                    y: list[float] = []
+                    for v12 in valid_raw12:
+                        v = raw12_to_voltage(v12, v_fs)
+                        v_corr = apply_calibration_to_voltage(v, v_fs, full_gain, full_offset_ppm)
+                        y.append(voltage_to_mA(v_corr, r_shunt))
+                    self.ax.set_ylabel("Current (mA) [calibrated]")
                 else:
                     y = [float(v) for v in valid_raw12]
                     self.ax.set_ylabel("Raw12 (value bits)")
@@ -488,38 +501,42 @@ class ScopeGUI(tk.Tk):
                         vmin = min(valid_raw12)
                         vmax = max(valid_raw12)
                         vavg = sum(valid_raw12) / float(len(valid_raw12))
-                        vavg_volt = raw12_to_voltage(int(vavg), v_fs)
-                        iavg_ma = voltage_to_mA(vavg_volt, r_shunt)
+
+                        # Raw (uncalibrated) avg
+                        vavg_volt_raw = raw12_to_voltage(int(vavg), v_fs)
+                        iavg_ma_raw = voltage_to_mA(vavg_volt_raw, r_shunt)
+
+                        # Calibrated avg (firmware semantics)
+                        vavg_volt_corr = apply_calibration_to_voltage(vavg_volt_raw, v_fs, full_gain, full_offset_ppm)
+                        iavg_ma_corr = voltage_to_mA(vavg_volt_corr, r_shunt)
                     else:
                         vmin = vmax = 0
                         vavg = 0.0
-                        vavg_volt = 0.0
-                        iavg_ma = 0.0
+                        vavg_volt_raw = 0.0
+                        iavg_ma_raw = 0.0
+                        vavg_volt_corr = 0.0
+                        iavg_ma_corr = 0.0
 
                     preview_n = min(8, len(raw12))
                     preview_vals = raw12[:preview_n]
                     preview_marks = marks[:preview_n] if marks is not None else None
 
-                    # read cal fields as-is from frame (if present)
-                    cal_off = frame.get("CalOffset", None)
-                    cal_gain = frame.get("CalGain", None)
-                    ch_off = frame.get("CalcOffsetScopeChannel", None)
-                    ch_gain = frame.get("CalcGainScopeChannel", None)
-
-                    # compute fullGain/fullOffset per documentation
-                    full_gain, full_offset = compute_full_gain_offset_from_frame(frame)
-
                     print(
                         f"[{mode_str}] Count={frame.get('Count')} DataLen={len(frame.get('Data', b''))} "
                         f"valid_raw[min,max,avg]=({vmin},{vmax},{vavg:.2f}) "
-                        f"V_FS={v_fs}V Rshunt={r_shunt}Ω  avgV={vavg_volt:.6f}V avgI={iavg_ma:.3f}mA"
+                        f"V_FS={v_fs}V Rshunt={r_shunt}Ω"
                     )
                     print(
                         f"  CalOffset={cal_off} CalGain={cal_gain} "
-                        f"ChOffset={ch_off} ChGain={ch_gain}  (GAIN_DIV={GAIN_DIV:g})"
+                        f"ChOffset={ch_off} ChGain={ch_gain} (GAIN_DIV={GAIN_DIV:g})"
                     )
                     print(
-                        f"  fullGain={full_gain:.10f} fullOffset={full_offset:.3f}"
+                        f"  fullGain={full_gain:.10f} fullOffset_ppm={full_offset_ppm:.3f}  "
+                        f"offset_as_volts={(full_offset_ppm/GAIN_DIV)*v_fs:.6f}V"
+                    )
+                    print(
+                        f"  avgV_raw={vavg_volt_raw:.6f}V  avgI_raw={iavg_ma_raw:.3f}mA  |  "
+                        f"avgV_cal={vavg_volt_corr:.6f}V  avgI_cal={iavg_ma_corr:.3f}mA"
                     )
                     print(f"  preview raw12 : {preview_vals}")
                     if preview_marks is not None:

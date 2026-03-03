@@ -13,76 +13,59 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 
-# ---------------------------------------------------------------------------
-# Scope payload decoding helpers
+# ============================================================================
+# Conversion model used here (based on firmware conventions for DT pressure):
 #
-# Firmware behavior (as described):
-#   - AVERAGE: payload is Count * uint16
-#       bits 0..11  = value (12-bit)
-#       bits 12..15 = marker/trigger flags (4-bit)
+# AVERAGE payload:
+#   uint16 per sample:
+#     bits 0..11  -> raw12 value (0..4095)
+#     bits 12..15 -> marker flags (0..15)
 #
-#   - MIN / MAX / MINMAX: payload is Count * uint32
-#       Usually two uint16 packed inside one uint32 (low16 / high16).
-#       Semantics (min vs max) may depend on mode; you can verify in practice.
+# For plotting/metrics we ignore samples with marks != 0 (trigger/marker events).
 #
-# All values are big-endian.
-# ---------------------------------------------------------------------------
+# RAW(12-bit) -> Voltage:
+#   V = (raw12 - 2048) / 2048.0 * V_FS
+#
+# For DT pressure/current front-end the effective full-scale used in practice is
+# typically 1.0 V (fits your 4 mA example well). If your firmware/hardware
+# variant uses 1.5 V, change V_FS below or make it a UI option.
+#
+# Voltage -> Current:
+#   I_mA = (V / R_SHUNT) * 1000
+#
+# Default R_SHUNT is 49.9 Ohm (typical 4..20 mA shunt).
+# ============================================================================
 
-def _gain_factor_ppm(gain_ppm: int) -> float:
-    """Firmware-style gain factor: 1 + gain/100000."""
-    return 1.0 + (float(gain_ppm) / 100000.0)
-
-
-def compute_full_gain_offset(frame: dict) -> tuple[float, float]:
-    """
-    Compute combined gain/offset based on the calibration fields in the frame.
-
-    Fields (from frame dict):
-      - CalOffset  (extOffset)               int16
-      - CalGain    (extGain)                 int16
-      - CalcOffsetScopeChannel (intOffset)   int16
-      - CalcGainScopeChannel   (intGain)     int16
-
-    Firmware math:
-      fullGain   = (1 + intGain/100000) * (1 + extGain/100000)
-      fullOffset = fullGain * intOffset + extOffset
-    """
-    ext_off = int(frame.get("CalOffset", 0))
-    ext_gain = int(frame.get("CalGain", 0))
-    int_off = int(frame.get("CalcOffsetScopeChannel", 0))
-    int_gain = int(frame.get("CalcGainScopeChannel", 0))
-
-    full_gain = _gain_factor_ppm(int_gain) * _gain_factor_ppm(ext_gain)
-    full_offset = (full_gain * float(int_off)) + float(ext_off)
-    return full_gain, full_offset
+V_FS_DEFAULT = 1.0       # Volts full-scale used for raw12->V mapping
+R_SHUNT_DEFAULT = 49.9   # Ohms shunt for V->I conversion
 
 
-def apply_calibration_to_values(values: list[float], full_gain: float, full_offset: float) -> list[float]:
-    """
-    Apply linear correction:
-      corrected = fullGain * raw + fullOffset
+def raw12_to_voltage(raw12: int, v_fs: float = V_FS_DEFAULT) -> float:
+    """Convert 12-bit offset-binary code to volts."""
+    return ((float(raw12) - 2048.0) / 2048.0) * float(v_fs)
 
-    Note: raw should be the *value bits only* (no marker bits).
-    """
-    return [(full_gain * v) + full_offset for v in values]
+
+def voltage_to_mA(v: float, r_shunt: float = R_SHUNT_DEFAULT) -> float:
+    """Convert volts across shunt to mA."""
+    return (float(v) / float(r_shunt)) * 1000.0
 
 
 def decode_scope_samples(frame: dict) -> dict:
     """
     Decode scope samples from one received frame.
 
-    Returns a dict with:
-      - "mode": str (AVERAGE / MIN / MAX / MINMAX / unknown)
-      - "values": list[int]        (decoded "value" samples; for non-AVERAGE this is a chosen view)
-      - "marks": list[int] | None  (only for AVERAGE, extracted 4-bit marker flags)
-      - "pairs": list[tuple[int,int]] | None  (for 32-bit modes: (low16, high16) per sample)
-      - "pairs_value_marks": list[tuple[tuple[int,int], tuple[int,int]]] | None
-            ((low_value12, high_value12), (low_marks, high_marks)) if you want to inspect flags in halves
+    Returns:
+      {
+        "mode": str,
+        "raw12": list[int],          # value bits only (12-bit), for chosen view
+        "marks": list[int] | None,   # marker flags (AVERAGE only)
+        "pairs": list[tuple[int,int]] | None,  # for 32-bit modes: (low16, high16)
+      }
     """
     data: bytes = frame["Data"]
     sample_method_id = frame["SampleMethod"]
 
-    # Resolve method name if possible
+    # resolve method name if possible
     method_name = None
     try:
         for k, v in MeasurementDevice.scope_sample_methods.items():
@@ -93,78 +76,59 @@ def decode_scope_samples(frame: dict) -> dict:
         method_name = None
     mode = method_name or f"UNKNOWN({sample_method_id})"
 
-    # AVERAGE: Count * uint16, with 12-bit value + 4-bit markers
     if sample_method_id == MeasurementDevice.scope_sample_methods.get("AVERAGE"):
-        sample_size = 2
-        n = len(data) // sample_size
-
-        values12: list[int] = []
+        n = len(data) // 2
+        raw12: list[int] = []
         marks: list[int] = []
-
         for i in range(n):
             (u16,) = struct.unpack(">H", data[i * 2:(i + 1) * 2])
-            values12.append(u16 & 0x0FFF)
+            raw12.append(u16 & 0x0FFF)
             marks.append((u16 >> 12) & 0x000F)
+        return {"mode": mode, "raw12": raw12, "marks": marks, "pairs": None}
 
-        return {
-            "mode": mode,
-            "values": values12,
-            "marks": marks,
-            "pairs": None,
-            "pairs_value_marks": None,
-        }
-
-    # Other modes: Count * uint32 (two uint16 halves)
-    sample_size = 4
-    n = len(data) // sample_size
-
+    # MIN/MAX/MINMAX (or other): uint32 per sample
+    n = len(data) // 4
     pairs: list[tuple[int, int]] = []
-    pairs_value_marks: list[tuple[tuple[int, int], tuple[int, int]]] = []
-
     for i in range(n):
         (u32,) = struct.unpack(">I", data[i * 4:(i + 1) * 4])
         low16 = u32 & 0xFFFF
         high16 = (u32 >> 16) & 0xFFFF
         pairs.append((low16, high16))
 
-        # If the FPGA also encodes marker bits in the 16-bit halves, you can inspect them:
-        low_val12 = low16 & 0x0FFF
-        low_marks = (low16 >> 12) & 0x000F
-        high_val12 = high16 & 0x0FFF
-        high_marks = (high16 >> 12) & 0x000F
-        pairs_value_marks.append(((low_val12, high_val12), (low_marks, high_marks)))
-
-    # For plotting we choose one view. For MINMAX it is often useful to plot the midpoint.
-    # You can change this easily once you confirm semantics.
-    values_view: list[int] = []
+    # Choose a simple view for plotting (still in raw12-value domain)
+    raw12_view: list[int] = []
     if method_name == "MINMAX":
         for low16, high16 in pairs:
-            # midpoint of the two halves (works nicely for a “single trace”)
-            values_view.append(((low16 & 0x0FFF) + (high16 & 0x0FFF)) // 2)
+            raw12_view.append(((low16 & 0x0FFF) + (high16 & 0x0FFF)) // 2)
     elif method_name == "MIN":
-        for low16, high16 in pairs:
-            values_view.append(low16 & 0x0FFF)
+        for low16, _high16 in pairs:
+            raw12_view.append(low16 & 0x0FFF)
     elif method_name == "MAX":
-        for low16, high16 in pairs:
-            values_view.append(high16 & 0x0FFF)
+        for _low16, high16 in pairs:
+            raw12_view.append(high16 & 0x0FFF)
     else:
-        for low16, high16 in pairs:
-            values_view.append(low16 & 0x0FFF)
+        for low16, _high16 in pairs:
+            raw12_view.append(low16 & 0x0FFF)
 
-    return {
-        "mode": mode,
-        "values": values_view,
-        "marks": None,
-        "pairs": pairs,
-        "pairs_value_marks": pairs_value_marks,
-    }
+    return {"mode": mode, "raw12": raw12_view, "marks": None, "pairs": pairs}
+
+
+def filter_valid_by_marks(raw12: list[int], marks: list[int] | None) -> list[int]:
+    """Return only samples with marks==0 (or all samples if marks is None)."""
+    if marks is None:
+        return raw12
+    out: list[int] = []
+    for v, m in zip(raw12, marks):
+        if m == 0:
+            out.append(v)
+    return out
 
 
 class ScopeGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("WaveScope GUI (DT Pressure Sensor 0x08)")
-        self.geometry("1100x700")
+        self.geometry("1100x720")
 
         self.vas: MeasurementDevice | None = None
         self.reader_thread: threading.Thread | None = None
@@ -174,19 +138,21 @@ class ScopeGUI(tk.Tk):
         self.ip_var = tk.StringVar(value="192.168.111.111")
         self.port_var = tk.StringVar(value="55555")
 
-        # Defaults that worked for you
         self.channel_var = tk.StringVar(value="A")
         self.range_var = tk.StringVar(value="NO")          # keep as in your working config
         self.coupling_var = tk.StringVar(value="DC")
         self.mode_var = tk.StringVar(value="MANUAL")
 
-        # Filter dropdown like in your screenshot
         self.filter_var = tk.StringVar(value="1MHz")
 
-        # Sample controls
         self.sample_rate_var = tk.StringVar(value="20MS")
         self.sample_mode_var = tk.StringVar(value="AVERAGE")
         self.count_var = tk.StringVar(value="1000")
+
+        # Display/Conversion controls
+        self.display_mode_var = tk.StringVar(value="RAW12")    # RAW12 or mA
+        self.vfs_var = tk.StringVar(value=str(V_FS_DEFAULT))   # 1.0 or 1.5 typically
+        self.rshunt_var = tk.StringVar(value=str(R_SHUNT_DEFAULT))
 
         # Axis scaling
         self.fixed_axis_var = tk.BooleanVar(value=True)
@@ -200,21 +166,15 @@ class ScopeGUI(tk.Tk):
         self.detected_dt1_var = tk.StringVar(value="----")
         self.detected_dt2_var = tk.StringVar(value="----")
 
-        # Plot options
-        self.plot_calibrated_var = tk.BooleanVar(value=False)  # plot corrected instead of raw
-        self.export_csv_var = tk.BooleanVar(value=True)        # write a small CSV snippet periodically
-
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # Matplotlib plot
         self._init_plot()
 
-        # Plot update timer
         self.latest_y: list[float] | None = None
         self.after(30, self._update_plot_loop)
 
-        # Throttle debug prints / CSV writes
+        # Throttle debug output
         self._last_debug_t = 0.0
         self._debug_interval_s = 1.0
 
@@ -251,41 +211,49 @@ class ScopeGUI(tk.Tk):
         ctrl = ttk.LabelFrame(top, text="Scope Settings", padding=10)
         ctrl.pack(side="left", fill="x", expand=True)
 
-        # Filter dropdown
         ttk.Label(ctrl, text="Filter:").grid(row=0, column=0, sticky="w")
         filters = list(MeasurementDevice.scope_filters.keys())
         ttk.Combobox(ctrl, textvariable=self.filter_var, values=filters, state="readonly", width=12).grid(
             row=0, column=1, sticky="w", padx=5
         )
 
-        # Sampling rate dropdown
         ttk.Label(ctrl, text="SampleRate:").grid(row=0, column=2, sticky="w")
         rates = list(MeasurementDevice.scope_sample_rates.keys())
         ttk.Combobox(ctrl, textvariable=self.sample_rate_var, values=rates, state="readonly", width=12).grid(
             row=0, column=3, sticky="w", padx=5
         )
 
-        # Count
         ttk.Label(ctrl, text="Count:").grid(row=0, column=4, sticky="w")
         ttk.Entry(ctrl, textvariable=self.count_var, width=8).grid(row=0, column=5, sticky="w", padx=5)
 
-        # Sample mode radios
         mode_box = ttk.LabelFrame(ctrl, text="SampleMode", padding=8)
         mode_box.grid(row=1, column=0, columnspan=6, sticky="we", pady=(10, 0))
-
         for i, name in enumerate(["AVERAGE", "MAX", "MIN", "MINMAX"]):
             ttk.Radiobutton(mode_box, text=f"rb{name.title()}", value=name, variable=self.sample_mode_var).grid(
                 row=0, column=i, sticky="w", padx=8
             )
 
-        # Start/Stop + plot options
         btns = ttk.Frame(ctrl)
         btns.grid(row=2, column=0, columnspan=6, sticky="w", pady=(10, 0))
         ttk.Button(btns, text="Start", command=self.start_stream).pack(side="left", padx=(0, 10))
         ttk.Button(btns, text="Stop", command=self.stop_stream).pack(side="left", padx=(0, 10))
 
-        ttk.Checkbutton(btns, text="Plot calibrated", variable=self.plot_calibrated_var).pack(side="left", padx=(0, 10))
-        ttk.Checkbutton(btns, text="Write CSV snippet", variable=self.export_csv_var).pack(side="left")
+        # Display / conversion box
+        disp = ttk.LabelFrame(ctrl, text="Display / Conversion", padding=8)
+        disp.grid(row=3, column=0, columnspan=6, sticky="we", pady=(10, 0))
+
+        ttk.Label(disp, text="Y-axis:").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(disp, textvariable=self.display_mode_var, values=["RAW12", "mA"], state="readonly", width=8).grid(
+            row=0, column=1, sticky="w", padx=5
+        )
+
+        ttk.Label(disp, text="V_FS:").grid(row=0, column=2, sticky="e", padx=(10, 2))
+        ttk.Entry(disp, textvariable=self.vfs_var, width=8).grid(row=0, column=3, sticky="w")
+        ttk.Label(disp, text="V").grid(row=0, column=4, sticky="w")
+
+        ttk.Label(disp, text="R_shunt:").grid(row=0, column=5, sticky="e", padx=(10, 2))
+        ttk.Entry(disp, textvariable=self.rshunt_var, width=8).grid(row=0, column=6, sticky="w")
+        ttk.Label(disp, text="Ω").grid(row=0, column=7, sticky="w")
 
         # Axis frame
         axf = ttk.LabelFrame(outer, text="Axis Scaling", padding=10)
@@ -305,16 +273,15 @@ class ScopeGUI(tk.Tk):
         ttk.Label(axf, text="Ymax").grid(row=0, column=7, sticky="e", padx=(10, 2))
         ttk.Entry(axf, textvariable=self.ymax_var, width=8).grid(row=0, column=8, sticky="w")
 
-        # Plot area frame
         self.plot_frame = ttk.Frame(outer)
         self.plot_frame.pack(fill="both", expand=True, pady=(10, 0))
 
     def _init_plot(self):
         self.fig = Figure(figsize=(8, 5), dpi=100)
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_title("Scope (samples)")
+        self.ax.set_title("Scope")
         self.ax.set_xlabel("Sample index")
-        self.ax.set_ylabel("Value")
+        self.ax.set_ylabel("Raw12")
         self.line, = self.ax.plot([], [])
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
@@ -339,7 +306,6 @@ class ScopeGUI(tk.Tk):
             return
 
         try:
-            # Check connected sensors + 0x08 position
             connected = self.vas.ServiceGetConnectedSensors()
             self.detected_dt1_var.set(f"0x{connected['DT_1']:04X}")
             self.detected_dt2_var.set(f"0x{connected['DT_2']:04X}")
@@ -388,7 +354,6 @@ class ScopeGUI(tk.Tk):
             messagebox.showerror("Sensor not found", "No sensor with ID 0x08 detected on DT_1/DT_2.")
             return
 
-        # Validate count
         try:
             count = int(self.count_var.get().strip())
             if count <= 0 or count > 2000000:
@@ -397,10 +362,8 @@ class ScopeGUI(tk.Tk):
             messagebox.showerror("Invalid Count", "Count must be a positive integer.")
             return
 
-        # Configure plot title
         self.ax.set_title(f"Scope A @ {dt_socket} / DRUCK_30 (0x08)")
 
-        # Start worker thread
         self.stop_event.clear()
         self.reader_thread = threading.Thread(target=self._reader_worker, args=(dt_socket,), daemon=True)
         self.reader_thread.start()
@@ -411,7 +374,6 @@ class ScopeGUI(tk.Tk):
             self.reader_thread.join(timeout=1.0)
         self.reader_thread = None
 
-        # Cleanup scope once
         if self.vas is not None:
             try:
                 self.vas.Scope_Stop()
@@ -422,25 +384,11 @@ class ScopeGUI(tk.Tk):
             except Exception:
                 pass
 
-    def _write_csv_snippet(self, mode: str, values: list[float], marks: list[int] | None, full_gain: float, full_offset: float):
-        """
-        Write a small CSV snippet for easy Excel import.
-        Overwrites a file 'scope_snippet.csv' in the current working directory.
-        """
-        if not self.export_csv_var.get():
-            return
-
-        # Keep it small and simple: first N samples.
-        N = min(200, len(values))
-        path = "scope_snippet.csv"
-
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("index,raw_value,corrected_value,marks,mode,fullGain,fullOffset\n")
-            for i in range(N):
-                raw_v = values[i]
-                corr_v = (full_gain * raw_v) + full_offset
-                mk = marks[i] if (marks is not None and i < len(marks)) else ""
-                f.write(f"{i},{raw_v},{corr_v},{mk},{mode},{full_gain},{full_offset}\n")
+    def _get_float_setting(self, var: tk.StringVar, fallback: float) -> float:
+        try:
+            return float(var.get().strip())
+        except Exception:
+            return fallback
 
     def _reader_worker(self, dt_socket: str):
         assert self.vas is not None
@@ -459,7 +407,6 @@ class ScopeGUI(tk.Tk):
         count = int(self.count_var.get().strip())
 
         def setup_scope():
-            # Important: apply the exact settings that the firmware supports
             self.vas.Scope_SetChannel(channel, socket_name, sensor, range_name, coupling, filter_name, mode)
             self.vas.Scope_Prepare(sample_rate, sample_method, count)
 
@@ -473,69 +420,67 @@ class ScopeGUI(tk.Tk):
                     continue
 
                 decoded = decode_scope_samples(frame)
-                values = decoded["values"]          # raw 12-bit (or a chosen view for 32-bit modes)
-                marks = decoded["marks"]            # only for AVERAGE
-                method_str = decoded["mode"]
+                raw12 = decoded["raw12"]
+                marks = decoded["marks"]
+                mode_str = decoded["mode"]
 
-                # Compute calibration coefficients from the frame
-                full_gain, full_offset = compute_full_gain_offset(frame)
+                # ignore marker samples for stats / conversion (AVERAGE only)
+                valid_raw12 = filter_valid_by_marks(raw12, marks)
 
-                # Decide what to plot
-                if self.plot_calibrated_var.get():
-                    y_plot = apply_calibration_to_values([float(v) for v in values], full_gain, full_offset)
-                    self.ax.set_ylabel("Corrected value (gain/offset applied)")
+                v_fs = self._get_float_setting(self.vfs_var, V_FS_DEFAULT)
+                r_shunt = self._get_float_setting(self.rshunt_var, R_SHUNT_DEFAULT)
+
+                # Choose what to display: RAW12 or mA
+                disp_mode = self.display_mode_var.get().strip().upper()
+                if disp_mode == "MA":
+                    y = [voltage_to_mA(raw12_to_voltage(v, v_fs), r_shunt) for v in valid_raw12]
+                    self.ax.set_ylabel("Current (mA)")
                 else:
-                    y_plot = [float(v) for v in values]
-                    self.ax.set_ylabel("Raw value (value bits only)")
+                    y = [float(v) for v in valid_raw12]
+                    self.ax.set_ylabel("Raw12 (value bits)")
 
-                self.latest_y = y_plot
+                self.latest_y = y
 
-                # Debug print (throttled) + CSV snippet (throttled)
+                # Throttled debug output
                 now = time.time()
                 if now - self._last_debug_t >= self._debug_interval_s:
                     self._last_debug_t = now
 
-                    # Some quick stats for Excel testing
-                    if values:
-                        vmin = min(values)
-                        vmax = max(values)
-                        vavg = sum(values) / float(len(values))
+                    if valid_raw12:
+                        vmin = min(valid_raw12)
+                        vmax = max(valid_raw12)
+                        vavg = sum(valid_raw12) / float(len(valid_raw12))
+                        vavg_volt = raw12_to_voltage(int(vavg), v_fs)
+                        iavg_ma = voltage_to_mA(vavg_volt, r_shunt)
                     else:
-                        vmin = vmax = vavg = float("nan")
+                        vmin = vmax = 0
+                        vavg = 0.0
+                        vavg_volt = 0.0
+                        iavg_ma = 0.0
 
-                    # Show first few samples for easy manual inspection
-                    preview_n = min(8, len(values))
-                    preview_vals = values[:preview_n]
+                    preview_n = min(8, len(raw12))
+                    preview_vals = raw12[:preview_n]
                     preview_marks = marks[:preview_n] if marks is not None else None
 
                     print(
-                        f"[{method_str}] Count={frame.get('Count')} DataLen={len(frame.get('Data', b''))} "
-                        f"raw[min,max,avg]=({vmin},{vmax},{vavg:.2f}) "
-                        f"fullGain={full_gain:.8f} fullOffset={full_offset:.3f} "
-                        f"extOff={frame.get('CalOffset')} extGain={frame.get('CalGain')} "
-                        f"intOff={frame.get('CalcOffsetScopeChannel')} intGain={frame.get('CalcGainScopeChannel')}"
+                        f"[{mode_str}] Count={frame.get('Count')} DataLen={len(frame.get('Data', b''))} "
+                        f"valid_raw[min,max,avg]=({vmin},{vmax},{vavg:.2f}) "
+                        f"V_FS={v_fs}V Rshunt={r_shunt}Ω  avgV={vavg_volt:.6f}V avgI={iavg_ma:.3f}mA"
                     )
-                    print(f"  preview raw values: {preview_vals}")
+                    print(f"  preview raw12 : {preview_vals}")
                     if preview_marks is not None:
-                        print(f"  preview marks     : {preview_marks}")
+                        print(f"  preview marks : {preview_marks}")
                     else:
-                        # For 32-bit modes, also show a couple of low/high halves
                         pairs = decoded.get("pairs")
                         if pairs:
                             print(f"  preview (low16,high16): {pairs[:min(4, len(pairs))]}")
 
-                    # Write CSV for Excel (first 200 samples)
-                    self._write_csv_snippet(method_str, [float(v) for v in values], marks, full_gain, full_offset)
-
-                # keep UI responsive; don't spin at 100%
                 time.sleep(0.001)
 
         except MeasurementDeviceError as e:
             msg = str(e)
 
-            # Recovery: if channel setup was lost, re-init.
             if "2027" in msg or "0x2027" in msg:
-                # Try a soft restart
                 try:
                     self.vas.Scope_Stop()
                 except Exception:
@@ -548,15 +493,13 @@ class ScopeGUI(tk.Tk):
                     try:
                         setup_scope()
                         self.vas.Scope_Start()
-                        return  # let outer loop end; user can press Start again if needed
+                        return
                     except Exception:
                         pass
 
-            # Show error in UI thread
             self.after(0, lambda: messagebox.showerror("Device error", msg))
 
         finally:
-            # Best-effort cleanup
             try:
                 self.vas.Scope_Stop()
             except Exception:
@@ -575,7 +518,6 @@ class ScopeGUI(tk.Tk):
                 self.line.set_data(x, y)
 
                 if self.fixed_axis_var.get():
-                    # Fixed axis
                     try:
                         xmin = float(self.xmin_var.get())
                         xmax = float(self.xmax_var.get())
@@ -588,10 +530,8 @@ class ScopeGUI(tk.Tk):
                         self.ax.set_xlim(xmin, xmax)
                         self.ax.set_ylim(ymin, ymax)
                     except ValueError:
-                        # If user types garbage, keep the last valid limits
                         pass
                 else:
-                    # Autoscale
                     self.ax.relim()
                     self.ax.autoscale_view()
 

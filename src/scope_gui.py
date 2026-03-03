@@ -13,29 +13,151 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 
-def decode_scope_samples(frame: dict) -> list[int]:
-    """
-    Convert packed scope sample bytes into Python ints.
+# ---------------------------------------------------------------------------
+# Scope payload decoding helpers
+#
+# Firmware behavior (as described):
+#   - AVERAGE: payload is Count * uint16
+#       bits 0..11  = value (12-bit)
+#       bits 12..15 = marker/trigger flags (4-bit)
+#
+#   - MIN / MAX / MINMAX: payload is Count * uint32
+#       Usually two uint16 packed inside one uint32 (low16 / high16).
+#       Semantics (min vs max) may depend on mode; you can verify in practice.
+#
+# All values are big-endian.
+# ---------------------------------------------------------------------------
 
-    - AVERAGE -> int16 (2 bytes/sample)
-    - others  -> int32 (4 bytes/sample)
+def _gain_factor_ppm(gain_ppm: int) -> float:
+    """Firmware-style gain factor: 1 + gain/100000."""
+    return 1.0 + (float(gain_ppm) / 100000.0)
+
+
+def compute_full_gain_offset(frame: dict) -> tuple[float, float]:
+    """
+    Compute combined gain/offset based on the calibration fields in the frame.
+
+    Fields (from frame dict):
+      - CalOffset  (extOffset)               int16
+      - CalGain    (extGain)                 int16
+      - CalcOffsetScopeChannel (intOffset)   int16
+      - CalcGainScopeChannel   (intGain)     int16
+
+    Firmware math:
+      fullGain   = (1 + intGain/100000) * (1 + extGain/100000)
+      fullOffset = fullGain * intOffset + extOffset
+    """
+    ext_off = int(frame.get("CalOffset", 0))
+    ext_gain = int(frame.get("CalGain", 0))
+    int_off = int(frame.get("CalcOffsetScopeChannel", 0))
+    int_gain = int(frame.get("CalcGainScopeChannel", 0))
+
+    full_gain = _gain_factor_ppm(int_gain) * _gain_factor_ppm(ext_gain)
+    full_offset = (full_gain * float(int_off)) + float(ext_off)
+    return full_gain, full_offset
+
+
+def apply_calibration_to_values(values: list[float], full_gain: float, full_offset: float) -> list[float]:
+    """
+    Apply linear correction:
+      corrected = fullGain * raw + fullOffset
+
+    Note: raw should be the *value bits only* (no marker bits).
+    """
+    return [(full_gain * v) + full_offset for v in values]
+
+
+def decode_scope_samples(frame: dict) -> dict:
+    """
+    Decode scope samples from one received frame.
+
+    Returns a dict with:
+      - "mode": str (AVERAGE / MIN / MAX / MINMAX / unknown)
+      - "values": list[int]        (decoded "value" samples; for non-AVERAGE this is a chosen view)
+      - "marks": list[int] | None  (only for AVERAGE, extracted 4-bit marker flags)
+      - "pairs": list[tuple[int,int]] | None  (for 32-bit modes: (low16, high16) per sample)
+      - "pairs_value_marks": list[tuple[tuple[int,int], tuple[int,int]]] | None
+            ((low_value12, high_value12), (low_marks, high_marks)) if you want to inspect flags in halves
     """
     data: bytes = frame["Data"]
-    sample_method = frame["SampleMethod"]
+    sample_method_id = frame["SampleMethod"]
 
-    if sample_method == MeasurementDevice.scope_sample_methods["AVERAGE"]:
+    # Resolve method name if possible
+    method_name = None
+    try:
+        for k, v in MeasurementDevice.scope_sample_methods.items():
+            if v == sample_method_id:
+                method_name = k
+                break
+    except Exception:
+        method_name = None
+    mode = method_name or f"UNKNOWN({sample_method_id})"
+
+    # AVERAGE: Count * uint16, with 12-bit value + 4-bit markers
+    if sample_method_id == MeasurementDevice.scope_sample_methods.get("AVERAGE"):
         sample_size = 2
-        fmt = ">h"
-    else:
-        sample_size = 4
-        fmt = ">i"
+        n = len(data) // sample_size
 
+        values12: list[int] = []
+        marks: list[int] = []
+
+        for i in range(n):
+            (u16,) = struct.unpack(">H", data[i * 2:(i + 1) * 2])
+            values12.append(u16 & 0x0FFF)
+            marks.append((u16 >> 12) & 0x000F)
+
+        return {
+            "mode": mode,
+            "values": values12,
+            "marks": marks,
+            "pairs": None,
+            "pairs_value_marks": None,
+        }
+
+    # Other modes: Count * uint32 (two uint16 halves)
+    sample_size = 4
     n = len(data) // sample_size
-    out = []
+
+    pairs: list[tuple[int, int]] = []
+    pairs_value_marks: list[tuple[tuple[int, int], tuple[int, int]]] = []
+
     for i in range(n):
-        (v,) = struct.unpack(fmt, data[i * sample_size : (i + 1) * sample_size])
-        out.append(v)
-    return out
+        (u32,) = struct.unpack(">I", data[i * 4:(i + 1) * 4])
+        low16 = u32 & 0xFFFF
+        high16 = (u32 >> 16) & 0xFFFF
+        pairs.append((low16, high16))
+
+        # If the FPGA also encodes marker bits in the 16-bit halves, you can inspect them:
+        low_val12 = low16 & 0x0FFF
+        low_marks = (low16 >> 12) & 0x000F
+        high_val12 = high16 & 0x0FFF
+        high_marks = (high16 >> 12) & 0x000F
+        pairs_value_marks.append(((low_val12, high_val12), (low_marks, high_marks)))
+
+    # For plotting we choose one view. For MINMAX it is often useful to plot the midpoint.
+    # You can change this easily once you confirm semantics.
+    values_view: list[int] = []
+    if method_name == "MINMAX":
+        for low16, high16 in pairs:
+            # midpoint of the two halves (works nicely for a “single trace”)
+            values_view.append(((low16 & 0x0FFF) + (high16 & 0x0FFF)) // 2)
+    elif method_name == "MIN":
+        for low16, high16 in pairs:
+            values_view.append(low16 & 0x0FFF)
+    elif method_name == "MAX":
+        for low16, high16 in pairs:
+            values_view.append(high16 & 0x0FFF)
+    else:
+        for low16, high16 in pairs:
+            values_view.append(low16 & 0x0FFF)
+
+    return {
+        "mode": mode,
+        "values": values_view,
+        "marks": None,
+        "pairs": pairs,
+        "pairs_value_marks": pairs_value_marks,
+    }
 
 
 class ScopeGUI(tk.Tk):
@@ -78,6 +200,10 @@ class ScopeGUI(tk.Tk):
         self.detected_dt1_var = tk.StringVar(value="----")
         self.detected_dt2_var = tk.StringVar(value="----")
 
+        # Plot options
+        self.plot_calibrated_var = tk.BooleanVar(value=False)  # plot corrected instead of raw
+        self.export_csv_var = tk.BooleanVar(value=True)        # write a small CSV snippet periodically
+
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -85,8 +211,12 @@ class ScopeGUI(tk.Tk):
         self._init_plot()
 
         # Plot update timer
-        self.latest_y: list[int] | None = None
+        self.latest_y: list[float] | None = None
         self.after(30, self._update_plot_loop)
+
+        # Throttle debug prints / CSV writes
+        self._last_debug_t = 0.0
+        self._debug_interval_s = 1.0
 
     # --------------------------------------------------------------------- UI
     def _build_ui(self):
@@ -139,7 +269,7 @@ class ScopeGUI(tk.Tk):
         ttk.Label(ctrl, text="Count:").grid(row=0, column=4, sticky="w")
         ttk.Entry(ctrl, textvariable=self.count_var, width=8).grid(row=0, column=5, sticky="w", padx=5)
 
-        # Sample mode radios (like your screenshot)
+        # Sample mode radios
         mode_box = ttk.LabelFrame(ctrl, text="SampleMode", padding=8)
         mode_box.grid(row=1, column=0, columnspan=6, sticky="we", pady=(10, 0))
 
@@ -148,11 +278,14 @@ class ScopeGUI(tk.Tk):
                 row=0, column=i, sticky="w", padx=8
             )
 
-        # Start/Stop buttons
+        # Start/Stop + plot options
         btns = ttk.Frame(ctrl)
         btns.grid(row=2, column=0, columnspan=6, sticky="w", pady=(10, 0))
         ttk.Button(btns, text="Start", command=self.start_stream).pack(side="left", padx=(0, 10))
-        ttk.Button(btns, text="Stop", command=self.stop_stream).pack(side="left")
+        ttk.Button(btns, text="Stop", command=self.stop_stream).pack(side="left", padx=(0, 10))
+
+        ttk.Checkbutton(btns, text="Plot calibrated", variable=self.plot_calibrated_var).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(btns, text="Write CSV snippet", variable=self.export_csv_var).pack(side="left")
 
         # Axis frame
         axf = ttk.LabelFrame(outer, text="Axis Scaling", padding=10)
@@ -179,9 +312,9 @@ class ScopeGUI(tk.Tk):
     def _init_plot(self):
         self.fig = Figure(figsize=(8, 5), dpi=100)
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_title("Scope (raw samples)")
+        self.ax.set_title("Scope (samples)")
         self.ax.set_xlabel("Sample index")
-        self.ax.set_ylabel("Raw value")
+        self.ax.set_ylabel("Value")
         self.line, = self.ax.plot([], [])
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
@@ -289,6 +422,26 @@ class ScopeGUI(tk.Tk):
             except Exception:
                 pass
 
+    def _write_csv_snippet(self, mode: str, values: list[float], marks: list[int] | None, full_gain: float, full_offset: float):
+        """
+        Write a small CSV snippet for easy Excel import.
+        Overwrites a file 'scope_snippet.csv' in the current working directory.
+        """
+        if not self.export_csv_var.get():
+            return
+
+        # Keep it small and simple: first N samples.
+        N = min(200, len(values))
+        path = "scope_snippet.csv"
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("index,raw_value,corrected_value,marks,mode,fullGain,fullOffset\n")
+            for i in range(N):
+                raw_v = values[i]
+                corr_v = (full_gain * raw_v) + full_offset
+                mk = marks[i] if (marks is not None and i < len(marks)) else ""
+                f.write(f"{i},{raw_v},{corr_v},{mk},{mode},{full_gain},{full_offset}\n")
+
     def _reader_worker(self, dt_socket: str):
         assert self.vas is not None
 
@@ -319,17 +472,60 @@ class ScopeGUI(tk.Tk):
                 if frame is None:
                     continue
 
-                y = decode_scope_samples(frame)
-                self.latest_y = y
-                print(
-                "raw[min,max]=", min(y), max(y),
-                "CalOff=", frame["CalOffset"],
-                "CalGain=", frame["CalGain"],
-                "ChOff=", frame["CalcOffsetScopeChannel"],
-                "ChGain=", frame["CalcGainScopeChannel"],
-                
-                print("Count=", frame["Count"], "DataLen=", len(frame["Data"]), "SampleMethod=", frame["SampleMethod"])
-)
+                decoded = decode_scope_samples(frame)
+                values = decoded["values"]          # raw 12-bit (or a chosen view for 32-bit modes)
+                marks = decoded["marks"]            # only for AVERAGE
+                method_str = decoded["mode"]
+
+                # Compute calibration coefficients from the frame
+                full_gain, full_offset = compute_full_gain_offset(frame)
+
+                # Decide what to plot
+                if self.plot_calibrated_var.get():
+                    y_plot = apply_calibration_to_values([float(v) for v in values], full_gain, full_offset)
+                    self.ax.set_ylabel("Corrected value (gain/offset applied)")
+                else:
+                    y_plot = [float(v) for v in values]
+                    self.ax.set_ylabel("Raw value (value bits only)")
+
+                self.latest_y = y_plot
+
+                # Debug print (throttled) + CSV snippet (throttled)
+                now = time.time()
+                if now - self._last_debug_t >= self._debug_interval_s:
+                    self._last_debug_t = now
+
+                    # Some quick stats for Excel testing
+                    if values:
+                        vmin = min(values)
+                        vmax = max(values)
+                        vavg = sum(values) / float(len(values))
+                    else:
+                        vmin = vmax = vavg = float("nan")
+
+                    # Show first few samples for easy manual inspection
+                    preview_n = min(8, len(values))
+                    preview_vals = values[:preview_n]
+                    preview_marks = marks[:preview_n] if marks is not None else None
+
+                    print(
+                        f"[{method_str}] Count={frame.get('Count')} DataLen={len(frame.get('Data', b''))} "
+                        f"raw[min,max,avg]=({vmin},{vmax},{vavg:.2f}) "
+                        f"fullGain={full_gain:.8f} fullOffset={full_offset:.3f} "
+                        f"extOff={frame.get('CalOffset')} extGain={frame.get('CalGain')} "
+                        f"intOff={frame.get('CalcOffsetScopeChannel')} intGain={frame.get('CalcGainScopeChannel')}"
+                    )
+                    print(f"  preview raw values: {preview_vals}")
+                    if preview_marks is not None:
+                        print(f"  preview marks     : {preview_marks}")
+                    else:
+                        # For 32-bit modes, also show a couple of low/high halves
+                        pairs = decoded.get("pairs")
+                        if pairs:
+                            print(f"  preview (low16,high16): {pairs[:min(4, len(pairs))]}")
+
+                    # Write CSV for Excel (first 200 samples)
+                    self._write_csv_snippet(method_str, [float(v) for v in values], marks, full_gain, full_offset)
 
                 # keep UI responsive; don't spin at 100%
                 time.sleep(0.001)

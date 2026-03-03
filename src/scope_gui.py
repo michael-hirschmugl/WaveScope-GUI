@@ -26,18 +26,28 @@ from matplotlib.figure import Figure
 # RAW(12-bit) -> Voltage:
 #   V = (raw12 - 2048) / 2048.0 * V_FS
 #
-# For DT pressure/current front-end the effective full-scale used in practice is
-# typically 1.0 V (fits your 4 mA example well). If your firmware/hardware
-# variant uses 1.5 V, change V_FS below or make it a UI option.
-#
 # Voltage -> Current:
 #   I_mA = (V / R_SHUNT) * 1000
 #
-# Default R_SHUNT is 49.9 Ohm (typical 4..20 mA shunt).
+# Calibration / correction (from documentation):
+#   data(corr.) = (gain/10000 + 1) * data + offset
+#
+# Here we compute:
+#   extGainFactor = 1 + CalGain/10000
+#   intGainFactor = 1 + ChGain/10000
+#   fullGain      = extGainFactor * intGainFactor
+#   fullOffset    = fullGain * ChOffset + CalOffset
+#
+# NOTE:
+# - This matches the formula style described in the docs.
+# - Some firmware paths historically use 100000 instead of 10000. If your results
+#   look off by ~10x in gain correction, change GAIN_DIV below accordingly.
 # ============================================================================
 
 V_FS_DEFAULT = 1.0       # Volts full-scale used for raw12->V mapping
 R_SHUNT_DEFAULT = 49.9   # Ohms shunt for V->I conversion
+
+GAIN_DIV = 10000.0       # per documentation: gain/10000 + 1
 
 
 def raw12_to_voltage(raw12: int, v_fs: float = V_FS_DEFAULT) -> float:
@@ -48,6 +58,34 @@ def raw12_to_voltage(raw12: int, v_fs: float = V_FS_DEFAULT) -> float:
 def voltage_to_mA(v: float, r_shunt: float = R_SHUNT_DEFAULT) -> float:
     """Convert volts across shunt to mA."""
     return (float(v) / float(r_shunt)) * 1000.0
+
+
+def compute_full_gain_offset_from_frame(frame: dict) -> tuple[float, float]:
+    """
+    Compute fullGain/fullOffset using the documentation formula:
+
+      data(corr.) = (gain/10000 + 1) * data + offset
+
+    We treat:
+      CalGain  -> external gain
+      CalOffset -> external offset
+      CalcGainScopeChannel -> channel/internal gain
+      CalcOffsetScopeChannel -> channel/internal offset
+
+    fullGain   = (1 + CalGain/GAIN_DIV) * (1 + ChGain/GAIN_DIV)
+    fullOffset = fullGain * ChOffset + CalOffset
+    """
+    cal_gain = float(frame.get("CalGain", 0))
+    cal_off = float(frame.get("CalOffset", 0))
+    ch_gain = float(frame.get("CalcGainScopeChannel", 0))
+    ch_off = float(frame.get("CalcOffsetScopeChannel", 0))
+
+    ext_gain_factor = 1.0 + (cal_gain / GAIN_DIV)
+    int_gain_factor = 1.0 + (ch_gain / GAIN_DIV)
+    full_gain = ext_gain_factor * int_gain_factor
+    full_offset = (full_gain * ch_off) + cal_off
+
+    return full_gain, full_offset
 
 
 def decode_scope_samples(frame: dict) -> dict:
@@ -462,10 +500,26 @@ class ScopeGUI(tk.Tk):
                     preview_vals = raw12[:preview_n]
                     preview_marks = marks[:preview_n] if marks is not None else None
 
+                    # read cal fields as-is from frame (if present)
+                    cal_off = frame.get("CalOffset", None)
+                    cal_gain = frame.get("CalGain", None)
+                    ch_off = frame.get("CalcOffsetScopeChannel", None)
+                    ch_gain = frame.get("CalcGainScopeChannel", None)
+
+                    # compute fullGain/fullOffset per documentation
+                    full_gain, full_offset = compute_full_gain_offset_from_frame(frame)
+
                     print(
                         f"[{mode_str}] Count={frame.get('Count')} DataLen={len(frame.get('Data', b''))} "
                         f"valid_raw[min,max,avg]=({vmin},{vmax},{vavg:.2f}) "
                         f"V_FS={v_fs}V Rshunt={r_shunt}Ω  avgV={vavg_volt:.6f}V avgI={iavg_ma:.3f}mA"
+                    )
+                    print(
+                        f"  CalOffset={cal_off} CalGain={cal_gain} "
+                        f"ChOffset={ch_off} ChGain={ch_gain}  (GAIN_DIV={GAIN_DIV:g})"
+                    )
+                    print(
+                        f"  fullGain={full_gain:.10f} fullOffset={full_offset:.3f}"
                     )
                     print(f"  preview raw12 : {preview_vals}")
                     if preview_marks is not None:

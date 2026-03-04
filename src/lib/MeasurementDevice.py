@@ -437,6 +437,32 @@ class MeasurementDevice:
             "DT_2_ID": ids["DT_2"],
         }
 
+    def CheckPressure60Sensor(self) -> Dict[str, Any]:
+        """
+        Convenience helper: check whether the 60 bar sensor (ID 0x03 / DRUCK_60) is connected.
+
+        Returns:
+            {
+              "DT_1": bool,
+              "DT_2": bool,
+              "any": bool,
+              "DT_1_ID": int,
+              "DT_2_ID": int
+            }
+        """
+        ids = self.ServiceGetConnectedSensors()
+        target = int(self.sensors["DRUCK_60"]) & 0xFFFF
+
+        on_dt1 = ids["DT_1"] == target
+        on_dt2 = ids["DT_2"] == target
+        return {
+            "DT_1": on_dt1,
+            "DT_2": on_dt2,
+            "any": on_dt1 or on_dt2,
+            "DT_1_ID": ids["DT_1"],
+            "DT_2_ID": ids["DT_2"],
+        }
+
     # --- URDI / DSO single-value measurement commands -----------------------
 
     def URDI_SetRange(self, socket_name: str, sensor: str, range_name: str, coupling: str, mode: str) -> None:

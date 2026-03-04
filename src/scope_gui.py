@@ -183,12 +183,12 @@ class ScopeGUI(tk.Tk):
 
         self.filter_var = tk.StringVar(value="1MHz")
 
-        self.sample_rate_var = tk.StringVar(value="20MS")
+        self.sample_rate_var = tk.StringVar(value="10KS")
         self.sample_mode_var = tk.StringVar(value="AVERAGE")
         self.count_var = tk.StringVar(value="1000")
 
         # Display/Conversion controls
-        self.display_mode_var = tk.StringVar(value="RAW12")    # RAW12 or mA
+        self.display_mode_var = tk.StringVar(value="mA")    # RAW12 or mA
         self.vfs_var = tk.StringVar(value=str(V_FS_DEFAULT))   # 1.0 or 1.5 typically
         self.rshunt_var = tk.StringVar(value=str(R_SHUNT_DEFAULT))
 
@@ -196,8 +196,8 @@ class ScopeGUI(tk.Tk):
         self.fixed_axis_var = tk.BooleanVar(value=True)
         self.xmin_var = tk.StringVar(value="0")
         self.xmax_var = tk.StringVar(value="1000")
-        self.ymin_var = tk.StringVar(value="-2000")
-        self.ymax_var = tk.StringVar(value="2000")
+        self.ymin_var = tk.StringVar(value="0")
+        self.ymax_var = tk.StringVar(value="25")
 
         # Detected socket display
         self.detected_socket_var = tk.StringVar(value="(not connected)")
@@ -319,7 +319,7 @@ class ScopeGUI(tk.Tk):
         self.ax = self.fig.add_subplot(111)
         self.ax.set_title("Scope")
         self.ax.set_xlabel("Sample index")
-        self.ax.set_ylabel("Raw12")
+        self.ax.set_ylabel("Current (mA) [calibrated]")
         self.line, = self.ax.plot([], [])
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)

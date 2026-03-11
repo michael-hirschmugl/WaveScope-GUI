@@ -29,6 +29,9 @@ from matplotlib.figure import Figure
 # Voltage -> Current:
 #   I_mA = (V / R_SHUNT) * 1000
 #
+# Current -> Pressure:
+#   P_bar = I_mA * PRESSURE_FACTOR
+#
 # Calibration (firmware semantics, important):
 #   - Gains are ppm-like: gainFactor = 1 + gain/100000
 #   - Offsets are also ppm-like and applied as fraction of full-range:
@@ -45,9 +48,10 @@ from matplotlib.figure import Figure
 #   intGain   = frame["CalcGainScopeChannel"]
 # ============================================================================
 
-V_FS_DEFAULT = 1.0        # Volts full-scale used for raw12->V mapping (DT front-end often 1.0V effective)
-R_SHUNT_DEFAULT = 49.9    # Ohms shunt for V->I conversion (typical 49.9Ω)
-GAIN_DIV = 100000.0       # firmware uses ppm-like scaling
+V_FS_DEFAULT = 1.0
+R_SHUNT_DEFAULT = 49.9
+PRESSURE_FACTOR_DEFAULT = 1.0
+GAIN_DIV = 100000.0
 
 
 def raw12_to_voltage(raw12: int, v_fs: float) -> float:
@@ -58,6 +62,11 @@ def raw12_to_voltage(raw12: int, v_fs: float) -> float:
 def voltage_to_mA(v: float, r_shunt: float) -> float:
     """Convert volts across shunt to mA."""
     return (float(v) / float(r_shunt)) * 1000.0
+
+
+def current_to_pressure_bar(i_ma: float, factor: float) -> float:
+    """Convert current in mA to pressure in bar."""
+    return float(i_ma) * float(factor)
 
 
 def compute_full_gain_and_offset_ppm(frame: dict) -> tuple[float, float]:
@@ -103,7 +112,6 @@ def decode_scope_samples(frame: dict) -> dict:
     data: bytes = frame["Data"]
     sample_method_id = frame["SampleMethod"]
 
-    # resolve method name if possible
     method_name = None
     try:
         for k, v in MeasurementDevice.scope_sample_methods.items():
@@ -124,7 +132,6 @@ def decode_scope_samples(frame: dict) -> dict:
             marks.append((u16 >> 12) & 0x000F)
         return {"mode": mode, "raw12": raw12, "marks": marks, "pairs": None}
 
-    # MIN/MAX/MINMAX (or other): uint32 per sample
     n = len(data) // 4
     pairs: list[tuple[int, int]] = []
     for i in range(n):
@@ -133,7 +140,6 @@ def decode_scope_samples(frame: dict) -> dict:
         high16 = (u32 >> 16) & 0xFFFF
         pairs.append((low16, high16))
 
-    # Choose a simple view for plotting (still in raw12-value domain)
     raw12_view: list[int] = []
     if method_name == "MINMAX":
         for low16, high16 in pairs:
@@ -166,7 +172,7 @@ class ScopeGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("WaveScope GUI (DT Pressure Sensor 0x08)")
-        self.geometry("1100x720")
+        self.geometry("1150x780")
 
         self.vas: MeasurementDevice | None = None
         self.reader_thread: threading.Thread | None = None
@@ -177,7 +183,7 @@ class ScopeGUI(tk.Tk):
         self.port_var = tk.StringVar(value="55555")
 
         self.channel_var = tk.StringVar(value="A")
-        self.range_var = tk.StringVar(value="NO")          # keep as in your working config
+        self.range_var = tk.StringVar(value="NO")
         self.coupling_var = tk.StringVar(value="DC")
         self.mode_var = tk.StringVar(value="MANUAL")
 
@@ -188,9 +194,10 @@ class ScopeGUI(tk.Tk):
         self.count_var = tk.StringVar(value="1000")
 
         # Display/Conversion controls
-        self.display_mode_var = tk.StringVar(value="mA")    # RAW12 or mA
-        self.vfs_var = tk.StringVar(value=str(V_FS_DEFAULT))   # 1.0 or 1.5 typically
+        self.display_mode_var = tk.StringVar(value="mA")  # RAW12 / mA / bar
+        self.vfs_var = tk.StringVar(value=str(V_FS_DEFAULT))
         self.rshunt_var = tk.StringVar(value=str(R_SHUNT_DEFAULT))
+        self.pressure_factor_var = tk.StringVar(value=str(PRESSURE_FACTOR_DEFAULT))
 
         # Axis scaling
         self.fixed_axis_var = tk.BooleanVar(value=True)
@@ -198,6 +205,13 @@ class ScopeGUI(tk.Tk):
         self.xmax_var = tk.StringVar(value="1000")
         self.ymin_var = tk.StringVar(value="0")
         self.ymax_var = tk.StringVar(value="25")
+
+        # Min/Max display
+        self.min_value_var = tk.StringVar(value="---")
+        self.max_value_var = tk.StringVar(value="---")
+        self.minmax_unit_var = tk.StringVar(value="mA")
+        self.global_min_value: float | None = None
+        self.global_max_value: float | None = None
 
         # Detected socket display
         self.detected_socket_var = tk.StringVar(value="(not connected)")
@@ -281,9 +295,13 @@ class ScopeGUI(tk.Tk):
         disp.grid(row=3, column=0, columnspan=6, sticky="we", pady=(10, 0))
 
         ttk.Label(disp, text="Y-axis:").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(disp, textvariable=self.display_mode_var, values=["RAW12", "mA"], state="readonly", width=8).grid(
-            row=0, column=1, sticky="w", padx=5
-        )
+        ttk.Combobox(
+            disp,
+            textvariable=self.display_mode_var,
+            values=["RAW12", "mA", "bar"],
+            state="readonly",
+            width=8
+        ).grid(row=0, column=1, sticky="w", padx=5)
 
         ttk.Label(disp, text="V_FS:").grid(row=0, column=2, sticky="e", padx=(10, 2))
         ttk.Entry(disp, textvariable=self.vfs_var, width=8).grid(row=0, column=3, sticky="w")
@@ -292,6 +310,29 @@ class ScopeGUI(tk.Tk):
         ttk.Label(disp, text="R_shunt:").grid(row=0, column=5, sticky="e", padx=(10, 2))
         ttk.Entry(disp, textvariable=self.rshunt_var, width=8).grid(row=0, column=6, sticky="w")
         ttk.Label(disp, text="Ω").grid(row=0, column=7, sticky="w")
+
+        ttk.Label(disp, text="mA→bar Faktor:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(disp, textvariable=self.pressure_factor_var, width=8).grid(
+            row=1, column=1, sticky="w", padx=5, pady=(8, 0)
+        )
+        ttk.Label(disp, text="bar/mA").grid(row=1, column=2, sticky="w", pady=(8, 0))
+
+        # Min/Max frame
+        mmf = ttk.LabelFrame(outer, text="Empfangene Min/Max-Werte", padding=10)
+        mmf.pack(fill="x", pady=(10, 0))
+
+        ttk.Label(mmf, text="Min:").grid(row=0, column=0, sticky="w")
+        ttk.Label(mmf, textvariable=self.min_value_var, width=14).grid(row=0, column=1, sticky="w", padx=(5, 15))
+
+        ttk.Label(mmf, text="Max:").grid(row=0, column=2, sticky="w")
+        ttk.Label(mmf, textvariable=self.max_value_var, width=14).grid(row=0, column=3, sticky="w", padx=(5, 15))
+
+        ttk.Label(mmf, text="Einheit:").grid(row=0, column=4, sticky="w")
+        ttk.Label(mmf, textvariable=self.minmax_unit_var, width=10).grid(row=0, column=5, sticky="w", padx=(5, 15))
+
+        ttk.Button(mmf, text="Min/Max zurücksetzen", command=self.reset_minmax).grid(
+            row=0, column=6, sticky="w", padx=(10, 0)
+        )
 
         # Axis frame
         axf = ttk.LabelFrame(outer, text="Axis Scaling", padding=10)
@@ -422,11 +463,67 @@ class ScopeGUI(tk.Tk):
             except Exception:
                 pass
 
+    def reset_minmax(self):
+        self.global_min_value = None
+        self.global_max_value = None
+        self.min_value_var.set("---")
+        self.max_value_var.set("---")
+        self.minmax_unit_var.set(self._get_display_unit())
+
     def _get_float_setting(self, var: tk.StringVar, fallback: float) -> float:
         try:
             return float(var.get().strip())
         except Exception:
             return fallback
+
+    def _get_display_unit(self) -> str:
+        mode = self.display_mode_var.get().strip().upper()
+        if mode == "MA":
+            return "mA"
+        if mode == "BAR":
+            return "bar"
+        return "raw12"
+
+    def _format_value_for_display(self, value: float, unit: str) -> str:
+        if unit == "raw12":
+            return f"{value:.0f}"
+        return f"{value:.3f}"
+
+    def _set_ylabel_for_mode(self, disp_mode: str):
+        mode = disp_mode.strip().upper()
+        if mode == "MA":
+            self.ax.set_ylabel("Current (mA) [calibrated]")
+        elif mode == "BAR":
+            self.ax.set_ylabel("Pressure (bar) [calibrated]")
+        else:
+            self.ax.set_ylabel("Raw12 (value bits)")
+
+    def _update_minmax_display(self):
+        unit = self._get_display_unit()
+        self.minmax_unit_var.set(unit)
+
+        if self.global_min_value is None or self.global_max_value is None:
+            self.min_value_var.set("---")
+            self.max_value_var.set("---")
+            return
+
+        self.min_value_var.set(self._format_value_for_display(self.global_min_value, unit))
+        self.max_value_var.set(self._format_value_for_display(self.global_max_value, unit))
+
+    def _update_global_minmax(self, y_values: list[float]):
+        if not y_values:
+            return
+
+        current_min = min(y_values)
+        current_max = max(y_values)
+
+        if self.global_min_value is None or current_min < self.global_min_value:
+            self.global_min_value = current_min
+
+        if self.global_max_value is None or current_max > self.global_max_value:
+            self.global_max_value = current_max
+
+        self._update_minmax_display()
 
     def _reader_worker(self, dt_socket: str):
         assert self.vas is not None
@@ -462,37 +559,43 @@ class ScopeGUI(tk.Tk):
                 marks = decoded["marks"]
                 mode_str = decoded["mode"]
 
-                # ignore marker samples for stats / conversion (AVERAGE only)
                 valid_raw12 = filter_valid_by_marks(raw12, marks)
 
                 v_fs = self._get_float_setting(self.vfs_var, V_FS_DEFAULT)
                 r_shunt = self._get_float_setting(self.rshunt_var, R_SHUNT_DEFAULT)
+                pressure_factor = self._get_float_setting(self.pressure_factor_var, PRESSURE_FACTOR_DEFAULT)
 
-                # Calibration fields from packet
                 cal_off = frame.get("CalOffset", 0)
                 cal_gain = frame.get("CalGain", 0)
                 ch_off = frame.get("CalcOffsetScopeChannel", 0)
                 ch_gain = frame.get("CalcGainScopeChannel", 0)
 
-                # Firmware-style full gain/offset (offset is ppm-of-full-range)
                 full_gain, full_offset_ppm = compute_full_gain_and_offset_ppm(frame)
 
-                # Choose what to display: RAW12 or calibrated mA
                 disp_mode = self.display_mode_var.get().strip().upper()
+
                 if disp_mode == "MA":
                     y: list[float] = []
                     for v12 in valid_raw12:
                         v = raw12_to_voltage(v12, v_fs)
                         v_corr = apply_calibration_to_voltage(v, v_fs, full_gain, full_offset_ppm)
-                        y.append(voltage_to_mA(v_corr, r_shunt))
-                    self.ax.set_ylabel("Current (mA) [calibrated]")
+                        i_ma = voltage_to_mA(v_corr, r_shunt)
+                        y.append(i_ma)
+                elif disp_mode == "BAR":
+                    y = []
+                    for v12 in valid_raw12:
+                        v = raw12_to_voltage(v12, v_fs)
+                        v_corr = apply_calibration_to_voltage(v, v_fs, full_gain, full_offset_ppm)
+                        i_ma = voltage_to_mA(v_corr, r_shunt)
+                        p_bar = current_to_pressure_bar(i_ma, pressure_factor)
+                        y.append(p_bar)
                 else:
                     y = [float(v) for v in valid_raw12]
-                    self.ax.set_ylabel("Raw12 (value bits)")
 
                 self.latest_y = y
+                self._set_ylabel_for_mode(disp_mode)
+                self._update_global_minmax(y)
 
-                # Throttled debug output
                 now = time.time()
                 if now - self._last_debug_t >= self._debug_interval_s:
                     self._last_debug_t = now
@@ -502,13 +605,12 @@ class ScopeGUI(tk.Tk):
                         vmax = max(valid_raw12)
                         vavg = sum(valid_raw12) / float(len(valid_raw12))
 
-                        # Raw (uncalibrated) avg
                         vavg_volt_raw = raw12_to_voltage(int(vavg), v_fs)
                         iavg_ma_raw = voltage_to_mA(vavg_volt_raw, r_shunt)
 
-                        # Calibrated avg (firmware semantics)
                         vavg_volt_corr = apply_calibration_to_voltage(vavg_volt_raw, v_fs, full_gain, full_offset_ppm)
                         iavg_ma_corr = voltage_to_mA(vavg_volt_corr, r_shunt)
+                        pavg_bar_corr = current_to_pressure_bar(iavg_ma_corr, pressure_factor)
                     else:
                         vmin = vmax = 0
                         vavg = 0.0
@@ -516,6 +618,7 @@ class ScopeGUI(tk.Tk):
                         iavg_ma_raw = 0.0
                         vavg_volt_corr = 0.0
                         iavg_ma_corr = 0.0
+                        pavg_bar_corr = 0.0
 
                     preview_n = min(8, len(raw12))
                     preview_vals = raw12[:preview_n]
@@ -524,7 +627,7 @@ class ScopeGUI(tk.Tk):
                     print(
                         f"[{mode_str}] Count={frame.get('Count')} DataLen={len(frame.get('Data', b''))} "
                         f"valid_raw[min,max,avg]=({vmin},{vmax},{vavg:.2f}) "
-                        f"V_FS={v_fs}V Rshunt={r_shunt}Ω"
+                        f"V_FS={v_fs}V Rshunt={r_shunt}Ω PressureFactor={pressure_factor}bar/mA"
                     )
                     print(
                         f"  CalOffset={cal_off} CalGain={cal_gain} "
@@ -532,11 +635,12 @@ class ScopeGUI(tk.Tk):
                     )
                     print(
                         f"  fullGain={full_gain:.10f} fullOffset_ppm={full_offset_ppm:.3f}  "
-                        f"offset_as_volts={(full_offset_ppm/GAIN_DIV)*v_fs:.6f}V"
+                        f"offset_as_volts={(full_offset_ppm / GAIN_DIV) * v_fs:.6f}V"
                     )
                     print(
                         f"  avgV_raw={vavg_volt_raw:.6f}V  avgI_raw={iavg_ma_raw:.3f}mA  |  "
-                        f"avgV_cal={vavg_volt_corr:.6f}V  avgI_cal={iavg_ma_corr:.3f}mA"
+                        f"avgV_cal={vavg_volt_corr:.6f}V  avgI_cal={iavg_ma_corr:.3f}mA  "
+                        f"avgP_cal={pavg_bar_corr:.3f}bar"
                     )
                     print(f"  preview raw12 : {preview_vals}")
                     if preview_marks is not None:
@@ -583,6 +687,9 @@ class ScopeGUI(tk.Tk):
     # --------------------------------------------------------------- Plot loop
     def _update_plot_loop(self):
         try:
+            self._set_ylabel_for_mode(self.display_mode_var.get())
+            self._update_minmax_display()
+
             if self.latest_y is not None:
                 y = self.latest_y
                 x = list(range(len(y)))

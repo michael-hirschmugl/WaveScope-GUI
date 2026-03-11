@@ -2,8 +2,10 @@
 import threading
 import time
 import struct
+import csv
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
+from datetime import datetime
 
 from lib.MeasurementDevice import MeasurementDevice, MeasurementDeviceError
 
@@ -168,11 +170,21 @@ def filter_valid_by_marks(raw12: list[int], marks: list[int] | None) -> list[int
     return out
 
 
+def decode_escape_sequences(value: str) -> str:
+    """
+    Convert UI escape sequences like '\\t', '\\n', '\\r\\n' into real characters.
+    """
+    try:
+        return value.encode("utf-8").decode("unicode_escape")
+    except Exception:
+        return value
+
+
 class ScopeGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("WaveScope GUI (DT Pressure Sensor 0x08)")
-        self.geometry("1150x780")
+        self.geometry("1180x840")
 
         self.vas: MeasurementDevice | None = None
         self.reader_thread: threading.Thread | None = None
@@ -212,6 +224,16 @@ class ScopeGUI(tk.Tk):
         self.minmax_unit_var = tk.StringVar(value="mA")
         self.global_min_value: float | None = None
         self.global_max_value: float | None = None
+
+        # Logging
+        self.column_delimiter_var = tk.StringVar(value=";")
+        self.row_delimiter_var = tk.StringVar(value="\\n")
+        self.log_status_var = tk.StringVar(value="Log: aus")
+        self.log_file_path_var = tk.StringVar(value="")
+        self.log_active = False
+        self.log_file = None
+        self.log_writer = None
+        self.log_lock = threading.Lock()
 
         # Detected socket display
         self.detected_socket_var = tk.StringVar(value="(not connected)")
@@ -334,6 +356,22 @@ class ScopeGUI(tk.Tk):
             row=0, column=6, sticky="w", padx=(10, 0)
         )
 
+        # Logging frame
+        logf = ttk.LabelFrame(outer, text="CSV-Logging", padding=10)
+        logf.pack(fill="x", pady=(10, 0))
+
+        ttk.Button(logf, text="Start Log", command=self.start_log).grid(row=0, column=0, sticky="w")
+        ttk.Button(logf, text="Stop Log", command=self.stop_log).grid(row=0, column=1, sticky="w", padx=(10, 20))
+
+        ttk.Label(logf, text="Column delimiter:").grid(row=0, column=2, sticky="e")
+        ttk.Entry(logf, textvariable=self.column_delimiter_var, width=8).grid(row=0, column=3, sticky="w", padx=(5, 15))
+
+        ttk.Label(logf, text="Row delimiter:").grid(row=0, column=4, sticky="e")
+        ttk.Entry(logf, textvariable=self.row_delimiter_var, width=8).grid(row=0, column=5, sticky="w", padx=(5, 15))
+
+        ttk.Label(logf, textvariable=self.log_status_var).grid(row=0, column=6, sticky="w", padx=(10, 10))
+        ttk.Label(logf, textvariable=self.log_file_path_var).grid(row=1, column=0, columnspan=7, sticky="w", pady=(8, 0))
+
         # Axis frame
         axf = ttk.LabelFrame(outer, text="Axis Scaling", padding=10)
         axf.pack(fill="x", pady=(10, 0))
@@ -402,6 +440,8 @@ class ScopeGUI(tk.Tk):
 
     def disconnect(self):
         self.stop_stream()
+        self.stop_log()
+
         if self.vas is not None:
             try:
                 self.vas.close()
@@ -463,6 +503,96 @@ class ScopeGUI(tk.Tk):
             except Exception:
                 pass
 
+    # ---------------------------------------------------------------- Logging
+    def start_log(self):
+        if self.log_active:
+            messagebox.showinfo("Logging", "Logging läuft bereits.")
+            return
+
+        delimiter = decode_escape_sequences(self.column_delimiter_var.get())
+        lineterminator = decode_escape_sequences(self.row_delimiter_var.get())
+
+        if delimiter == "":
+            messagebox.showerror("Ungültiger Delimiter", "Column delimiter darf nicht leer sein.")
+            return
+        if lineterminator == "":
+            messagebox.showerror("Ungültiger Delimiter", "Row delimiter darf nicht leer sein.")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title="CSV-Datei speichern",
+            defaultextension=".csv",
+            filetypes=[("CSV-Dateien", "*.csv"), ("Alle Dateien", "*.*")]
+        )
+        if not file_path:
+            return
+
+        try:
+            with self.log_lock:
+                self.log_file = open(file_path, "w", newline="", encoding="utf-8")
+                self.log_writer = csv.writer(
+                    self.log_file,
+                    delimiter=delimiter,
+                    lineterminator=lineterminator
+                )
+                self.log_writer.writerow([
+                    "timestamp",
+                    "display_mode",
+                    "unit",
+                    "packet_min",
+                    "packet_max",
+                    "global_min",
+                    "global_max"
+                ])
+                self.log_file.flush()
+                self.log_active = True
+                self.log_status_var.set("Log: aktiv")
+                self.log_file_path_var.set(file_path)
+        except Exception as e:
+            self.log_file = None
+            self.log_writer = None
+            self.log_active = False
+            messagebox.showerror("Logging-Fehler", f"CSV-Datei konnte nicht geöffnet werden:\n{e}")
+
+    def stop_log(self):
+        with self.log_lock:
+            if self.log_file is not None:
+                try:
+                    self.log_file.flush()
+                except Exception:
+                    pass
+                try:
+                    self.log_file.close()
+                except Exception:
+                    pass
+
+            self.log_file = None
+            self.log_writer = None
+            self.log_active = False
+            self.log_status_var.set("Log: aus")
+            self.log_file_path_var.set("")
+
+    def _write_log_row(self, packet_min: float, packet_max: float):
+        with self.log_lock:
+            if not self.log_active or self.log_writer is None or self.log_file is None:
+                return
+
+            unit = self._get_display_unit()
+            mode = self.display_mode_var.get().strip()
+            timestamp = datetime.now().isoformat(timespec="milliseconds")
+
+            self.log_writer.writerow([
+                timestamp,
+                mode,
+                unit,
+                self._format_value_for_log(packet_min, unit),
+                self._format_value_for_log(packet_max, unit),
+                self._format_value_for_log(self.global_min_value, unit),
+                self._format_value_for_log(self.global_max_value, unit),
+            ])
+            self.log_file.flush()
+
+    # ------------------------------------------------------------- Min / Max UI
     def reset_minmax(self):
         self.global_min_value = None
         self.global_max_value = None
@@ -488,6 +618,11 @@ class ScopeGUI(tk.Tk):
         if unit == "raw12":
             return f"{value:.0f}"
         return f"{value:.3f}"
+
+    def _format_value_for_log(self, value: float | None, unit: str) -> str:
+        if value is None:
+            return ""
+        return self._format_value_for_display(value, unit)
 
     def _set_ylabel_for_mode(self, disp_mode: str):
         mode = disp_mode.strip().upper()
@@ -594,7 +729,17 @@ class ScopeGUI(tk.Tk):
 
                 self.latest_y = y
                 self._set_ylabel_for_mode(disp_mode)
+
+                packet_min = None
+                packet_max = None
+                if y:
+                    packet_min = min(y)
+                    packet_max = max(y)
+
                 self._update_global_minmax(y)
+
+                if packet_min is not None and packet_max is not None:
+                    self._write_log_row(packet_min, packet_max)
 
                 now = time.time()
                 if now - self._last_debug_t >= self._debug_interval_s:
